@@ -1,3 +1,4 @@
+import base64
 import logging
 import os
 import time
@@ -31,6 +32,7 @@ from .models import (
     BotMediaRequest,
     BotMediaRequestMediaTypes,
     BotMediaRequestStates,
+    BotScreenCapture,
     BotStates,
     ChatMessage,
     Credentials,
@@ -1427,6 +1429,87 @@ class PauseRecordingView(APIView):
 
         except Bot.DoesNotExist:
             return Response({"error": "Bot not found"}, status=status.HTTP_404_NOT_FOUND)
+
+
+# Lezat fork: screen captures, taken only after they are turned on here.
+SCREEN_CAPTURE_STATES = (BotStates.JOINED_RECORDING, BotStates.JOINED_RECORDING_PAUSED, BotStates.JOINED_NOT_RECORDING)
+SCREEN_CAPTURES_PAGE_SIZE = 10
+
+
+class ScreenCapturesView(APIView):
+    authentication_classes = [ApiKeyAuthentication]
+    throttle_classes = [ProjectPostThrottle]
+
+    @extend_schema(
+        operation_id="List Screen Captures",
+        summary="Screen captures of the meeting (Lezat fork)",
+        description="Stills taken while someone shared their screen, oldest first, with the JPEG base64 encoded. Pages of 10: pass the last timestamp_ms as 'after' while has_more is true.",
+        parameters=[*TokenHeaderParameter],
+        tags=["Bots"],
+    )
+    def get(self, request, object_id):
+        try:
+            bot = Bot.objects.get(object_id=object_id, project=request.auth.project)
+        except Bot.DoesNotExist:
+            return Response({"error": "Bot not found"}, status=status.HTTP_404_NOT_FOUND)
+        captures = BotScreenCapture.objects.filter(bot=bot).order_by("timestamp_ms", "id")
+        after = request.query_params.get("after")
+        if after:
+            try:
+                captures = captures.filter(timestamp_ms__gt=int(after))
+            except ValueError:
+                return Response({"error": "after must be a timestamp in ms"}, status=status.HTTP_400_BAD_REQUEST)
+        page = list(captures[: SCREEN_CAPTURES_PAGE_SIZE + 1])
+        results = [
+            {
+                "id": capture.object_id,
+                "timestamp_ms": capture.timestamp_ms,
+                "width": capture.width,
+                "height": capture.height,
+                "content_type": capture.content_type,
+                "data": base64.b64encode(bytes(capture.image)).decode("ascii"),
+            }
+            for capture in page[:SCREEN_CAPTURES_PAGE_SIZE]
+        ]
+        return Response({"results": results, "has_more": len(page) > SCREEN_CAPTURES_PAGE_SIZE})
+
+    @extend_schema(
+        operation_id="Toggle Screen Captures",
+        summary="Turn screen captures on or off (Lezat fork)",
+        description='Body {"enabled": true|false}. While on, the bot keeps a still of the meeting every 15 s while someone shares their screen.',
+        parameters=[*TokenHeaderParameter],
+        tags=["Bots"],
+    )
+    def post(self, request, object_id):
+        try:
+            bot = Bot.objects.get(object_id=object_id, project=request.auth.project)
+        except Bot.DoesNotExist:
+            return Response({"error": "Bot not found"}, status=status.HTTP_404_NOT_FOUND)
+        enabled = request.data.get("enabled") if isinstance(request.data, dict) else None
+        if not isinstance(enabled, bool):
+            return Response({"error": "enabled must be true or false"}, status=status.HTTP_400_BAD_REQUEST)
+        if bot.state not in SCREEN_CAPTURE_STATES:
+            return Response(
+                {"error": f"Bot is in state {BotStates.state_to_api_code(bot.state)} and cannot take screen captures"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        send_sync_command(bot, "start_screen_captures" if enabled else "stop_screen_captures")
+        return Response({"enabled": enabled}, status=status.HTTP_200_OK)
+
+    @extend_schema(
+        operation_id="Delete Screen Captures",
+        summary="Delete the bot's screen captures (Lezat fork)",
+        description="Once copied elsewhere: the images are kept in the database and would pile up.",
+        parameters=[*TokenHeaderParameter],
+        tags=["Bots"],
+    )
+    def delete(self, request, object_id):
+        try:
+            bot = Bot.objects.get(object_id=object_id, project=request.auth.project)
+        except Bot.DoesNotExist:
+            return Response({"error": "Bot not found"}, status=status.HTTP_404_NOT_FOUND)
+        deleted, _ = BotScreenCapture.objects.filter(bot=bot).delete()
+        return Response({"deleted": deleted}, status=status.HTTP_200_OK)
 
 
 class ResumeRecordingView(APIView):

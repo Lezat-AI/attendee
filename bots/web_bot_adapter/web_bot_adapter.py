@@ -570,6 +570,14 @@ class WebBotAdapter(BotAdapter):
     def send_login_required_message(self):
         self.send_message_callback({"message": self.Messages.LOGIN_REQUIRED})
 
+    def capture_screenshot_png(self):
+        # Lezat fork: what the bot sees in the meeting, for screen captures.
+        try:
+            return self.driver.get_screenshot_as_png()
+        except Exception as e:
+            logger.warning(f"Error capturing screenshot: {e}")
+            return None
+
     def capture_screenshot_and_mhtml_file(self):
         # Take a screenshot and mhtml file of the page, because it is helpful to have for debugging
         current_time = datetime.datetime.now()
@@ -1335,6 +1343,10 @@ class WebBotAdapter(BotAdapter):
             self.silence_detection_activated = True
             self.last_audio_message_processed_time = time.time()
             logger.info(f"Silence detection activated after {self.automatic_leave_configuration.silence_activate_after_seconds} seconds")
+
+        # Lezat fork: a paused bot gets no captions on purpose; that is not silence.
+        if self.recording_paused and self.last_audio_message_processed_time is not None:
+            self.last_audio_message_processed_time = time.time()
 
         if self.last_audio_message_processed_time is not None and self.silence_detection_activated:
             if time.time() - self.last_audio_message_processed_time > self.automatic_leave_configuration.silence_timeout_seconds:

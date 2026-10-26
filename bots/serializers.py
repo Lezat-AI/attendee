@@ -662,6 +662,7 @@ BOT_RECORDING_SETTINGS_DEFAULT_VALUES = {
     "record_async_transcription_audio_chunks": False,
     "record_participant_speech_start_stop_events": False,
     "reserve_additional_storage": False,
+    "keep_incoming_video": False,
 }
 BOT_RECORDING_SETTINGS_SCHEMA = {
     "type": "object",
@@ -697,6 +698,11 @@ BOT_RECORDING_SETTINGS_SCHEMA = {
         "reserve_additional_storage": {
             "type": "boolean",
             "description": "Whether to reserve extra space to store the recording. Only needed when the bot will record video for longer than 6 hours. Defaults to false.",
+            "default": False,
+        },
+        "keep_incoming_video": {
+            "type": "boolean",
+            "description": "Lezat fork: receive the others' video and shared screens even when no video is recorded, so screen captures can be turned on during the meeting. Defaults to false.",
             "default": False,
         },
     },

@@ -39,6 +39,7 @@ from bots.models import (
     BotMediaRequestManager,
     BotMediaRequestMediaTypes,
     BotMediaRequestStates,
+    BotScreenCapture,
     BotStates,
     ChatMessage,
     ChatMessageToOptions,
@@ -80,6 +81,7 @@ from .realtime_audio_output_manager import RealtimeAudioOutputManager
 from .rtmp_client import RTMPClient
 from .s3_file_uploader import S3FileUploader
 from .screen_and_audio_recorder import ScreenAndAudioRecorder
+from .screen_capture_manager import ScreenCaptureManager
 from .video_output_manager import VideoOutputManager
 from .webpage_streamer_manager import WebpageStreamerManager
 
@@ -118,6 +120,8 @@ class BotController:
         return self.save_utterances_for_individual_audio_chunks() or self.bot_in_db.record_async_transcription_audio_chunks()
 
     def disable_incoming_video_for_web_bots(self):
+        if self.bot_in_db.keep_incoming_video():
+            return False
         return not (self.pipeline_configuration.record_video or self.pipeline_configuration.rtmp_stream_video or self.pipeline_configuration.websocket_stream_per_participant_video)
 
     def should_modify_dom_for_video_recording_for_web_bots(self):
@@ -995,6 +999,13 @@ class BotController:
             play_video_callback=self.adapter.send_video,
         )
 
+        # Lezat fork: stills of shared screens, only after the API turns them on.
+        self.screen_capture_manager = ScreenCaptureManager(
+            take_screenshot_callback=self.take_screenshot_for_screen_capture,
+            save_capture_callback=self.save_screen_capture,
+            is_paused_callback=lambda: bool(getattr(self.adapter, "recording_paused", False)),
+        )
+
         self.webpage_streamer_manager = None
         if self.bot_in_db.should_launch_webpage_streamer():
             self.webpage_streamer_manager = WebpageStreamerManager(
@@ -1309,6 +1320,9 @@ class BotController:
                 logger.info(f"Resuming recording for bot {self.bot_in_db.object_id}")
                 self.bot_in_db.refresh_from_db()
                 self.resume_recording()
+            elif command == "start_screen_captures" or command == "stop_screen_captures":
+                logger.info(f"Screen captures for bot {self.bot_in_db.object_id}. Command: {command}")
+                self.screen_capture_manager.set_enabled(command == "start_screen_captures")
             elif command == "admit_from_waiting_room":
                 logger.info(f"Admitting from waiting room for bot {self.bot_in_db.object_id}")
                 self.bot_in_db.refresh_from_db()
@@ -1319,6 +1333,21 @@ class BotController:
                 self.change_gallery_view_page(next_page=(command == "change_gallery_view_page_next"))
             else:
                 logger.info(f"Unknown command: {command}")
+
+    def take_screenshot_for_screen_capture(self):
+        # Only the web adapters (Google Meet, Teams, Zoom web) have a browser to screenshot.
+        take_screenshot = getattr(self.adapter, "capture_screenshot_png", None)
+        return take_screenshot() if take_screenshot else None
+
+    def save_screen_capture(self, *, image, width, height, timestamp_ms):
+        BotScreenCapture.objects.create(
+            bot=self.bot_in_db,
+            image=image,
+            width=width,
+            height=height,
+            timestamp_ms=timestamp_ms,
+        )
+        logger.info(f"Saved screen capture for bot {self.bot_in_db.object_id} ({width}x{height}, {len(image)} bytes)")
 
     def admit_from_waiting_room(self):
         if not BotEventManager.is_state_that_can_admit_from_waiting_room(self.bot_in_db.state):
@@ -1435,6 +1464,12 @@ class BotController:
 
             # Take a resource snapshot if needed
             self.bot_resource_snapshot_taker.save_snapshot_if_needed()
+
+            # Lezat fork: a failed screen capture must never end the bot.
+            try:
+                self.screen_capture_manager.capture_if_due()
+            except Exception as e:
+                logger.warning(f"Error taking screen capture: {e}")
 
             return True
 
@@ -1687,6 +1722,12 @@ class BotController:
         # Don't send webhook for the bot itself
         if participant.is_the_bot:
             return
+
+        # Lezat fork: screen captures only while someone shares their screen.
+        if participant_event.event_type == ParticipantEventTypes.SCREENSHARE_START:
+            self.screen_capture_manager.on_screenshare_start(participant.uuid)
+        elif participant_event.event_type == ParticipantEventTypes.SCREENSHARE_STOP:
+            self.screen_capture_manager.on_screenshare_stop(participant.uuid)
 
         # Set the trigger type based on the event type
         if participant_event.event_type == ParticipantEventTypes.JOIN or participant_event.event_type == ParticipantEventTypes.LEAVE:

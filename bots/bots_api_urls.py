@@ -70,6 +70,11 @@ urlpatterns = [
         name="bot-resume-recording",
     ),
     path(
+        "bots/<str:object_id>/screen_captures",
+        bots_api_views.ScreenCapturesView.as_view(),
+        name="bot-screen-captures",
+    ),
+    path(
         "bots/<str:object_id>/admit_from_waiting_room",
         bots_api_views.AdmitFromWaitingRoomView.as_view(),
         name="bot-admit-from-waiting-room",

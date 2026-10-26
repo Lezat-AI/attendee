@@ -936,6 +936,9 @@ class Bot(models.Model):
         # Delete all chat messages
         self.chat_messages.all().delete()
 
+        # Delete all screen captures
+        self.screen_captures.all().delete()
+
         # Delete all webhook delivery attempts that have a trigger other than BOT_STATE_CHANGE, since these contain sensitive data
         webhook_delivery_attempts_with_sensitive_data = self.webhook_delivery_attempts.exclude(webhook_trigger_type=WebhookTriggerTypes.BOT_STATE_CHANGE)
         webhook_delivery_attempts_with_sensitive_data.delete()
@@ -1173,6 +1176,14 @@ class Bot(models.Model):
         if recording_settings is None:
             recording_settings = {}
         return recording_settings.get("format", RecordingFormats.MP4)
+
+    def keep_incoming_video(self):
+        # Lezat fork: still receive the others' video (and shared screens) when
+        # nothing is recorded, so screen captures can be turned on mid-meeting.
+        recording_settings = self.settings.get("recording_settings", {})
+        if recording_settings is None:
+            recording_settings = {}
+        return recording_settings.get("keep_incoming_video", False)
 
     def record_chat_messages_when_paused(self):
         recording_settings = self.settings.get("recording_settings", {})
@@ -3319,6 +3330,35 @@ class ChatMessage(models.Model):
     def save(self, *args, **kwargs):
         if not self.object_id:
             # Generate a random 16-character string
+            random_string = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))
+            self.object_id = f"{self.OBJECT_ID_PREFIX}{random_string}"
+        super().save(*args, **kwargs)
+
+
+class BotScreenCapture(models.Model):
+    """A still of the meeting taken while someone shares their screen.
+
+    Lezat fork: only taken after the API turns captures on for the bot (people
+    in the meeting ask for it), and kept in the database because the bots run
+    without remote storage.
+    """
+
+    OBJECT_ID_PREFIX = "cap_"
+
+    bot = models.ForeignKey(Bot, on_delete=models.CASCADE, related_name="screen_captures")
+    object_id = models.CharField(max_length=32, unique=True, editable=False)
+    timestamp_ms = models.BigIntegerField()
+    image = models.BinaryField()
+    content_type = models.CharField(max_length=32, default="image/jpeg")
+    width = models.IntegerField()
+    height = models.IntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["timestamp_ms"]
+
+    def save(self, *args, **kwargs):
+        if not self.object_id:
             random_string = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))
             self.object_id = f"{self.OBJECT_ID_PREFIX}{random_string}"
         super().save(*args, **kwargs)
