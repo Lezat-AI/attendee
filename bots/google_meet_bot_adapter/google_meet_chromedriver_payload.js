@@ -1957,7 +1957,9 @@ function convertCaptionV2ToV1(captionWrapperV2) {
     const captionEventV2 = captionWrapperV2?.captionEventV2;
     const captionV2 = captionEventV2?.captionV2;
 
-    if (!captionEventV2 || !captionV2) {
+    // Lezat fork: Meet also sends caption events without a device (seen
+    // right after changing the captions language); they belong to nobody.
+    if (!captionEventV2 || !captionV2 || !captionV2.deviceId) {
         return null;
     }
 

@@ -382,9 +382,17 @@ class WebBotAdapter(BotAdapter):
         if self.recording_paused:
             return
 
+        caption = json_data.get("caption") or {}
+        # Lezat fork: a caption without device or id (Meet sends some after a
+        # language change) used to raise here and close the websocket, leaving
+        # the bot without captions or chat for the rest of the meeting.
+        if not caption.get("deviceId") or caption.get("captionId") is None:
+            logger.warning("Skipping caption without deviceId/captionId")
+            return
+
         # Count a caption as audio activity
         self.last_audio_message_processed_time = time.time()
-        self.upsert_caption_callback(json_data["caption"])
+        self.upsert_caption_callback(caption)
 
     def handle_participant_speech_start_stop_event(self, json_data):
         self.add_participant_event_callback({"participant_uuid": json_data["participantId"], "event_type": ParticipantEventTypes.SPEECH_START if json_data["isSpeechStart"] else ParticipantEventTypes.SPEECH_STOP, "event_data": {}, "timestamp_ms": int(json_data["timestamp"])})
