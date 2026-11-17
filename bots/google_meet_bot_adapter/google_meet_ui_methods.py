@@ -121,6 +121,27 @@ class GoogleMeetUIMethods:
             logger.info("Clicking others_may_see_your_meeting_differently_button")
             self.click_element_forcefully(others_may_see_your_meeting_differently_button, step)
 
+    # Some meetings show a "Continue as guest" / "Sign in with Google" screen before the name input
+    # (Google Meet change of 12-11-2026; ported from upstream attendee 84dc3b7b/9c51d237/31ac5494)
+    def look_for_continue_as_guest_button(self, step):
+        continue_as_guest_button = self.find_element_by_selector(By.XPATH, '//button[contains(., "Continue as guest")] | //div[@role="button"][contains(., "Continue as guest")]')
+        if not continue_as_guest_button:
+            return
+
+        if not hasattr(self, "continue_as_guest_button_last_clicked_at"):
+            self.continue_as_guest_button_last_clicked_at = None
+
+        # The page takes a moment to transition after clicking, so don't click again while that's happening
+        if self.continue_as_guest_button_last_clicked_at and time.time() - self.continue_as_guest_button_last_clicked_at < 10:
+            return
+
+        logger.info("Clicking continue_as_guest_button")
+        if self.ui_interaction_mode == "humanized":
+            self.humanized_navigate_to_and_click_element(continue_as_guest_button)
+        else:
+            self.click_element_with_fallback_to_forceful_click(continue_as_guest_button, step)
+        self.continue_as_guest_button_last_clicked_at = time.time()
+
     def look_for_blocked_element(self, step):
         cannot_join_element = self.find_element_by_selector(By.XPATH, '//*[contains(text(), "You can\'t join this video call") or contains(text(), "There is a problem connecting to this video call")]')
         if cannot_join_element:
@@ -278,7 +299,7 @@ class GoogleMeetUIMethods:
         return False
 
     def retrieve_name_input_element(self):
-        return WebDriverWait(self.driver, 1).until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'input[type="text"][aria-label="Your name"]')))
+        return WebDriverWait(self.driver, 1).until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'input[type="text"][aria-label="Your name"], input[type="text"][aria-label="Enter your name"]')))
 
     UNSHIFTED_PUNCTUATION = {
         "-": "minus",
@@ -504,6 +525,7 @@ class GoogleMeetUIMethods:
             except TimeoutException as e:
                 self.look_for_blocked_element("name_input")
                 self.look_for_login_required_element("name_input")
+                self.look_for_continue_as_guest_button("name_input")
                 self.check_if_meeting_is_found()
 
                 if self.google_meet_bot_login_session and self.join_now_button_is_present():
