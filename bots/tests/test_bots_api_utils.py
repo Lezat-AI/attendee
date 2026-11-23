@@ -1,14 +1,16 @@
 from datetime import timedelta
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from django.core.exceptions import ValidationError
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from accounts.models import Organization
+from bots.bot_controller import BotController
 from bots.bots_api_utils import BotCreationSource, build_internal_site_url, build_site_url, create_bot, create_webhook_subscription, patch_bot, validate_bot_concurrency_limit, validate_meeting_url_and_credentials
 from bots.calendars_api_utils import create_calendar
-from bots.models import Bot, BotEventManager, BotEventTypes, BotLoginGroup, BotLoginPlatform, BotStates, CalendarEvent, CalendarPlatform, Project, TranscriptionProviders, WebhookSubscription, WebhookTriggerTypes, ZoomOAuthApp
+from bots.models import Bot, BotEventManager, BotEventTypes, BotLoginGroup, BotLoginPlatform, BotStates, CalendarEvent, CalendarPlatform, Project, TranscriptionProviders, TranscriptionTypes, WebhookSubscription, WebhookTriggerTypes, ZoomOAuthApp
+from bots.serializers import CreateAsyncTranscriptionSerializer
 
 
 class TestBuildSiteUrl(TestCase):
@@ -45,18 +47,20 @@ class TestBuildSiteUrl(TestCase):
         self.assertEqual(result, "http://localhost:9000/callback")
 
     @patch("bots.bots_api_utils.settings")
-    @patch.dict("os.environ", {"INTERNAL_SITE_DOMAIN": "attendee-app.ai.svc.cluster.local:8000"}, clear=True)
+    @patch.dict("os.environ", {}, clear=True)
     def test_build_internal_site_url_uses_internal_domain_over_http(self, mock_settings):
         """Test that internal callbacks target INTERNAL_SITE_DOMAIN over http."""
         mock_settings.SITE_DOMAIN = "production.example.com"
+        mock_settings.INTERNAL_SITE_DOMAIN = "attendee-app.ai.svc.cluster.local:8000"
         result = build_internal_site_url("/cookie")
         self.assertEqual(result, "http://attendee-app.ai.svc.cluster.local:8000/cookie")
 
     @patch("bots.bots_api_utils.settings")
-    @patch.dict("os.environ", {"INTERNAL_SITE_DOMAIN": "attendee-app.ai.svc.cluster.local:8000", "EXTERNAL_WEBHOOK_SITE_DOMAIN": "external.example.com"}, clear=True)
+    @patch.dict("os.environ", {"EXTERNAL_WEBHOOK_SITE_DOMAIN": "external.example.com"}, clear=True)
     def test_build_site_url_external_ignores_internal_domain(self, mock_settings):
         """Test that external (default) URLs are unaffected by INTERNAL_SITE_DOMAIN."""
         mock_settings.SITE_DOMAIN = "production.example.com"
+        mock_settings.INTERNAL_SITE_DOMAIN = "attendee-app.ai.svc.cluster.local:8000"
         result = build_site_url("/webhook")
         self.assertEqual(result, "https://external.example.com/webhook")
 
@@ -65,6 +69,7 @@ class TestBuildSiteUrl(TestCase):
     def test_build_internal_site_url_falls_back_to_external_domain_when_unset(self, mock_settings):
         """Test that internal callbacks fall back to the external domain when INTERNAL_SITE_DOMAIN is unset."""
         mock_settings.SITE_DOMAIN = "production.example.com"
+        mock_settings.INTERNAL_SITE_DOMAIN = None
         result = build_internal_site_url("/cookie")
         self.assertEqual(result, "https://external.example.com/cookie")
 
@@ -113,7 +118,106 @@ class TestCreateBot(TestCase):
         self.assertIsNotNone(bot.recordings.first())
         self.assertIsNone(error)
         self.assertEqual(bot.recordings.first().transcription_provider, TranscriptionProviders.DEEPGRAM)
+        self.assertEqual(bot.recordings.first().transcription_type, TranscriptionTypes.NON_REALTIME)
         self.assertEqual(bot.use_zoom_web_adapter(), False)
+
+    def test_create_zoom_native_bot_with_transcription_disabled(self):
+        ZoomOAuthApp.objects.create(project=self.project, client_id="123")
+        bot, error = create_bot(
+            data={
+                "meeting_url": "https://zoom.us/j/123456789",
+                "bot_name": "Test Bot",
+                "recording_settings": {"format": "none"},
+                "websocket_settings": {"audio": {"url": "wss://example.com/audio"}},
+                "zoom_settings": {"sdk": "native"},
+                "transcription_settings": {"enabled": False},
+            },
+            source=BotCreationSource.API,
+            project=self.project,
+        )
+
+        self.assertIsNotNone(bot)
+        self.assertIsNone(error)
+        self.assertEqual(bot.settings["transcription_settings"], {"enabled": False})
+        self.assertEqual(bot.recordings.first().transcription_provider, TranscriptionProviders.NO_TRANSCRIPTION)
+        self.assertEqual(bot.recordings.first().transcription_type, TranscriptionTypes.NON_REALTIME)
+
+        controller = BotController(bot.id)
+        self.assertFalse(controller.should_capture_audio_chunks())
+        self.assertIsNone(controller.get_per_participant_audio_chunk_callback())
+
+        controller.get_zoom_oauth_credentials_and_tokens = lambda: ({"client_id": "123", "client_secret": "secret"}, {})
+        controller.gstreamer_pipeline = None
+        with patch("bots.zoom_bot_adapter.ZoomBotAdapter") as zoom_bot_adapter:
+            controller.get_zoom_bot_adapter()
+
+        adapter_kwargs = zoom_bot_adapter.call_args.kwargs
+        self.assertIsNone(adapter_kwargs["add_audio_chunk_callback"])
+        self.assertTrue(adapter_kwargs["use_mixed_audio"])
+        self.assertIsNotNone(adapter_kwargs["add_mixed_audio_chunk_callback"])
+
+        with patch("bots.zoom_rtms_adapter.ZoomRTMSAdapter") as zoom_rtms_adapter:
+            controller.get_zoom_rtms_adapter()
+
+        rtms_adapter_kwargs = zoom_rtms_adapter.call_args.kwargs
+        self.assertIsNone(rtms_adapter_kwargs["add_audio_chunk_callback"])
+        self.assertIsNone(rtms_adapter_kwargs["upsert_caption_callback"])
+
+    def test_zoom_native_audio_activity_is_tracked_without_transcription_callback(self):
+        from bots.zoom_bot_adapter import ZoomBotAdapter
+
+        adapter = object.__new__(ZoomBotAdapter)
+        adapter.my_participant_id = None
+        adapter.recording_is_paused = False
+        adapter.last_audio_received_at = None
+        adapter.add_audio_chunk_callback = None
+        audio_data = MagicMock()
+
+        with patch("bots.zoom_bot_adapter.zoom_bot_adapter.time.time", return_value=123.0):
+            adapter.on_one_way_audio_raw_data_received_callback(audio_data, node_id=456)
+
+        self.assertEqual(adapter.last_audio_received_at, 123.0)
+        audio_data.GetBuffer.assert_not_called()
+
+    def test_create_zoom_native_bot_with_transcription_enabled_uses_explicit_provider(self):
+        ZoomOAuthApp.objects.create(project=self.project, client_id="123")
+        bot, error = create_bot(
+            data={
+                "meeting_url": "https://zoom.us/j/123456789",
+                "bot_name": "Test Bot",
+                "transcription_settings": {"enabled": True, "deepgram": {"language": "en"}},
+                "zoom_settings": {"sdk": "native"},
+            },
+            source=BotCreationSource.API,
+            project=self.project,
+        )
+
+        self.assertIsNotNone(bot)
+        self.assertIsNone(error)
+        self.assertEqual(bot.recordings.first().transcription_provider, TranscriptionProviders.DEEPGRAM)
+        self.assertEqual(bot.recordings.first().transcription_type, TranscriptionTypes.NON_REALTIME)
+
+    def test_create_google_meet_bot_with_transcription_disabled(self):
+        bot, error = create_bot(
+            data={
+                "meeting_url": "https://meet.google.com/abc-defg-hij",
+                "bot_name": "Test Bot",
+                "transcription_settings": {"enabled": False},
+            },
+            source=BotCreationSource.API,
+            project=self.project,
+        )
+
+        self.assertIsNotNone(bot)
+        self.assertIsNone(error)
+        self.assertEqual(bot.recordings.first().transcription_provider, TranscriptionProviders.NO_TRANSCRIPTION)
+        self.assertEqual(bot.recordings.first().transcription_type, TranscriptionTypes.NON_REALTIME)
+
+    def test_async_transcription_rejects_disabled_transcription(self):
+        serializer = CreateAsyncTranscriptionSerializer(data={"transcription_settings": {"enabled": False}})
+
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("transcription_settings", serializer.errors)
 
     def test_create_zoom_bot_with_default_settings_and_web_adapter(self):
         ZoomOAuthApp.objects.create(project=self.project, client_id="123")

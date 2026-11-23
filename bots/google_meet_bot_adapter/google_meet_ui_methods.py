@@ -122,7 +122,6 @@ class GoogleMeetUIMethods:
             self.click_element_forcefully(others_may_see_your_meeting_differently_button, step)
 
     # Some meetings show a "Continue as guest" / "Sign in with Google" screen before the name input
-    # (Google Meet change of 12-11-2026; ported from upstream attendee 84dc3b7b/9c51d237/31ac5494)
     def look_for_continue_as_guest_button(self, step):
         continue_as_guest_button = self.find_element_by_selector(By.XPATH, '//button[contains(., "Continue as guest")] | //div[@role="button"][contains(., "Continue as guest")]')
         if not continue_as_guest_button:
@@ -395,10 +394,7 @@ class GoogleMeetUIMethods:
         if not hasattr(self, "mocap_manager"):
             self.mocap_manager = MocapManager(video_frame_size=self.video_frame_size)
 
-    def humanized_navigate_to_and_click_element(self, element):
-        self.ensure_x11_input()
-        self.ensure_mocap_manager()
-
+    def _measure_clickable_rect(self, element):
         metrics = self.driver.execute_script(
             """
             const el = arguments[0];
@@ -428,7 +424,8 @@ class GoogleMeetUIMethods:
         dpr = float(metrics["dpr"])
 
         if width <= 0 or height <= 0:
-            raise RuntimeError(f"Element has invalid size: {width}x{height}")
+            logger.warning(f"Element has invalid size: {width}x{height}")
+            return None
 
         # Clickable rect: half the width and half the height, centered
         inset_x = 0
@@ -443,15 +440,45 @@ class GoogleMeetUIMethods:
         rect_right = int(round((screen_x + clickable_css_right) * dpr))
         rect_bottom = int(round((screen_y + clickable_css_bottom) * dpr))
 
-        ptr = self.x11_input.root.query_pointer()._data
-        current_x = int(ptr["root_x"])
-        current_y = int(ptr["root_y"])
+        return rect_left, rect_top, rect_right, rect_bottom, screen_x, screen_y, dpr
 
-        logger.info(f"humanized interaction: mouse at ({current_x},{current_y}), clickable rect [({rect_left},{rect_top})-({rect_right},{rect_bottom})]")
+    def _is_element_at_monitor_point(self, element, monitor_x, monitor_y, screen_x, screen_y, dpr):
+        return self.driver.execute_script(
+            """
+            var el = document.elementFromPoint(arguments[0], arguments[1]);
+            var expected = arguments[2];
+            return !!el && (el === expected || expected.contains(el));
+            """,
+            monitor_x / dpr - screen_x,
+            monitor_y / dpr - screen_y,
+            element,
+        )
+
+    def _get_pointer_position(self):
+        ptr = self.x11_input.root.query_pointer()._data
+        return int(ptr["root_x"]), int(ptr["root_y"])
+
+    def humanized_navigate_to_and_click_element(self, element, fallback_to_forceful_click_for_zero_size_element=False, verify_element_under_mouse_before_click=False):
+        self.ensure_x11_input()
+        self.ensure_mocap_manager()
 
         seq = None
         num_seq_attempts = 10
         for attempt in range(num_seq_attempts):
+            # The mouse may have moved in a previous attempt, so re-read its position each time
+            current_x, current_y = self._get_pointer_position()
+
+            # The element can move between attempts (e.g. while the page is still transitioning), so re-measure it each time
+            clickable_rect = self._measure_clickable_rect(element)
+            if clickable_rect is None:
+                if fallback_to_forceful_click_for_zero_size_element:
+                    logger.warning("Element has zero size. Falling back to forceful click.")
+                    self.click_element_forcefully(element, "humanized_navigate_to_and_click_element:zero_size_fallback")
+                    return
+                raise RuntimeError("Element has invalid size")
+            rect_left, rect_top, rect_right, rect_bottom, screen_x, screen_y, dpr = clickable_rect
+            logger.info(f"humanized interaction: mouse at ({current_x},{current_y}), clickable rect [({rect_left},{rect_top})-({rect_right},{rect_bottom})]")
+
             seq = self.mocap_manager.find_random_sequence_landing_in_rect(current_x, current_y, rect_left, rect_top, rect_right, rect_bottom)
 
             # If we have hit dead ends 2 times in the past, we will stretch the mocap path to fit the desired endpoint
@@ -466,40 +493,39 @@ class GoogleMeetUIMethods:
 
             endpoint_monitor_x = current_x + seq.total_dx
             endpoint_monitor_y = current_y + seq.total_dy
-            endpoint_page_x = endpoint_monitor_x / dpr - screen_x
-            endpoint_page_y = endpoint_monitor_y / dpr - screen_y
 
-            is_element_at_endpoint = self.driver.execute_script(
-                """
-                var el = document.elementFromPoint(arguments[0], arguments[1]);
-                var expected = arguments[2];
-                return !!el && (el === expected || expected.contains(el));
-                """,
-                endpoint_page_x,
-                endpoint_page_y,
-                element,
-            )
+            if not self._is_element_at_monitor_point(element, endpoint_monitor_x, endpoint_monitor_y, screen_x, screen_y, dpr):
+                logger.info(f"humanized interaction: predicted endpoint ({endpoint_monitor_x},{endpoint_monitor_y}) not on target element, retrying (attempt {attempt + 1}/{num_seq_attempts})")
+                continue
 
-            if is_element_at_endpoint:
+            logger.info(f"humanized interaction: selected sequence with {len(seq.movements)} movements, total_dx={seq.total_dx}, total_dy={seq.total_dy}")
+
+            for move in seq.movements:
+                dt = move.get("dt", 0)
+                if dt > 0:
+                    time.sleep(dt)
+                dx = move.get("dx", 0)
+                dy = move.get("dy", 0)
+                if dx or dy:
+                    self.x11_input.move_rel(dx, dy)
+
+            if seq.click_down_dt > 0:
+                time.sleep(seq.click_down_dt)
+
+            if not verify_element_under_mouse_before_click:
                 break
 
-            logger.info(f"humanized interaction: endpoint page coords ({endpoint_page_x:.1f}, {endpoint_page_y:.1f}) not on target element, retrying (attempt {attempt + 1}/{num_seq_attempts})")
+            # The page can change while the mouse is moving (layout shift, overlay appearing), and the mouse may not
+            # end up exactly where predicted. So right before clicking, confirm the element is under the actual mouse position.
+            actual_x, actual_y = self._get_pointer_position()
+            if self._is_element_at_monitor_point(element, actual_x, actual_y, screen_x, screen_y, dpr):
+                break
+
+            logger.info(f"humanized interaction: after moving, mouse at ({actual_x},{actual_y}) is not on target element, retrying (attempt {attempt + 1}/{num_seq_attempts})")
         else:
-            raise RuntimeError(f"Could not find mocap sequence landing on target element after {num_seq_attempts} attempts")
+            self.send_screenshot_and_mhtml_file_message()
+            raise RuntimeError(f"Could not land mouse on target element after {num_seq_attempts} attempts")
 
-        logger.info(f"humanized interaction: selected sequence with {len(seq.movements)} movements, total_dx={seq.total_dx}, total_dy={seq.total_dy}")
-
-        for move in seq.movements:
-            dt = move.get("dt", 0)
-            if dt > 0:
-                time.sleep(dt)
-            dx = move.get("dx", 0)
-            dy = move.get("dy", 0)
-            if dx or dy:
-                self.x11_input.move_rel(dx, dy)
-
-        if seq.click_down_dt > 0:
-            time.sleep(seq.click_down_dt)
         self.x11_input.button_press("left")
 
         if seq.click_up_dt > 0:
@@ -515,7 +541,7 @@ class GoogleMeetUIMethods:
                 self.check_for_failed_logged_in_bot_attempt()
                 logger.info("name input found")
                 if self.ui_interaction_mode == "humanized":
-                    self.humanized_navigate_to_and_click_element(name_input)
+                    self.humanized_navigate_to_and_click_element(name_input, verify_element_under_mouse_before_click=True)
                     logger.info("Name input clicked")
                     self.human_copy_and_paste(self.display_name)
                     logger.info("Name input filled out")
@@ -1010,7 +1036,7 @@ class GoogleMeetUIMethods:
         self.google_meet_bot_login_session = {"login_type": "okta"}
 
     def _okta_session_redis_key(self):
-        domain = os.getenv("OKTA_BOT_LOGIN_DOMAIN", "")
+        domain = settings.OKTA_BOT_LOGIN_DOMAIN or ""
         username = os.getenv("OKTA_BOT_LOGIN_USERNAME", "")
         totp_secret = os.getenv("OKTA_BOT_LOGIN_TOTP_SECRET", "")
         fingerprint = hashlib.sha256(f"{domain}|{username}|{totp_secret}".encode()).hexdigest()
@@ -1036,7 +1062,7 @@ class GoogleMeetUIMethods:
         usage_key = f"{cookie_key}:uses"
         lock_key = f"{cookie_key}:lock"
 
-        okta_domain = os.getenv("OKTA_BOT_LOGIN_DOMAIN")
+        okta_domain = settings.OKTA_BOT_LOGIN_DOMAIN
         # Lock TTL must comfortably exceed the worst-case TOTP+navigation flow.
         lock_ttl_seconds = 120
         # Total time to wait for another bot to finish before giving up.
@@ -1091,7 +1117,7 @@ class GoogleMeetUIMethods:
             time.sleep(poll_interval_seconds)
 
     def save_valid_okta_session_token_in_redis(self):
-        okta_domain = os.getenv("OKTA_BOT_LOGIN_DOMAIN")
+        okta_domain = settings.OKTA_BOT_LOGIN_DOMAIN
         okta_authenticator = OktaAuthenticator(
             okta_domain=okta_domain,
             username=os.getenv("OKTA_BOT_LOGIN_USERNAME"),
@@ -1134,7 +1160,7 @@ class GoogleMeetUIMethods:
             time.sleep(1)
 
     def login_to_google_meet_account(self):
-        if os.getenv("USE_OKTA_LOGIN_FOR_SIGNED_IN_GOOGLE_MEET_BOTS", "false") == "true":
+        if settings.USE_OKTA_LOGIN_FOR_SIGNED_IN_GOOGLE_MEET_BOTS:
             try:
                 self.login_to_google_meet_account_with_okta()
                 return

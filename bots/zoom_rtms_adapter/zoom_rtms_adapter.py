@@ -18,6 +18,15 @@ from gi.repository import GLib  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+# RTMS messages can pass websockets' 1 MiB default, which closes the socket with 1009: media frames are
+# base64 inside JSON (Zoom sent 1.35 and 1.49 MB in dev), and signaling participant lists grow with the meeting.
+# Keep a bound rather than max_size=None so a runaway message can't exhaust memory.
+RTMS_WS_MAX_SIZE = 16 * 1024 * 1024
+# websockets buffers up to max_queue unread messages; cap it so a slow consumer holds at most 64 MiB per socket.
+RTMS_WS_MAX_QUEUE = 4
+# Media messages above websockets' old default are worth noting once per socket, not per frame.
+LARGE_MEDIA_MESSAGE_BYTES = 1024 * 1024
+
 # Try import websockets; don't break import-time if it's missing in some environments
 try:
     import websockets  # type: ignore
@@ -344,7 +353,7 @@ class RTMSClient:
         ssl_context = self._build_ssl_context(self.signaling_url)
 
         try:
-            async with websockets.connect(self.signaling_url, ssl=ssl_context) as ws:
+            async with websockets.connect(self.signaling_url, ssl=ssl_context, max_size=RTMS_WS_MAX_SIZE, max_queue=RTMS_WS_MAX_QUEUE) as ws:
                 self.signaling_ws = ws
                 logger.info("Signaling WebSocket connected to %s", self.signaling_url)
 
@@ -462,7 +471,7 @@ class RTMSClient:
         ssl_context = self._build_ssl_context(media_url)
 
         try:
-            async with websockets.connect(media_url, ssl=ssl_context) as ws:
+            async with websockets.connect(media_url, ssl=ssl_context, max_size=RTMS_WS_MAX_SIZE, max_queue=RTMS_WS_MAX_QUEUE) as ws:
                 self.media_ws = ws
                 logger.info("Media WebSocket connected to %s", media_url)
 
@@ -486,6 +495,7 @@ class RTMSClient:
                 logger.info("Sending media handshake: %s", handshake)
                 await ws.send(json.dumps(handshake))
 
+                large_message_logged = False
                 async for raw in ws:
                     if self._closing.is_set():
                         break
@@ -499,6 +509,9 @@ class RTMSClient:
                     msg_type = msg.get("msg_type")
                     content = msg.get("content", {})
                     logger.debug("Media message: %s", msg)
+                    if len(raw) > LARGE_MEDIA_MESSAGE_BYTES and not large_message_logged:
+                        large_message_logged = True
+                        logger.warning("Large media message: msg_type=%s size=%d", msg_type, len(raw))
 
                     # Media handshake response
                     if msg_type == 4 and msg.get("status_code") == 0:  # DATA_HAND_SHAKE_RESP
@@ -697,7 +710,6 @@ class ZoomRTMSAdapter(BotAdapter):
     def __init__(
         self,
         *,
-        use_one_way_audio,
         use_mixed_audio,
         use_video,
         send_message_callback,
@@ -714,7 +726,6 @@ class ZoomRTMSAdapter(BotAdapter):
         video_frame_size: tuple[int, int],
     ):
         self.zoom_rtms = zoom_rtms
-        self.use_one_way_audio = use_one_way_audio
         self.use_mixed_audio = use_mixed_audio
         self.use_video = use_video
         self.send_message_callback = send_message_callback
@@ -788,7 +799,7 @@ class ZoomRTMSAdapter(BotAdapter):
         try:
             if self.use_mixed_audio and self.add_mixed_audio_chunk_callback:
                 self.add_mixed_audio_chunk_callback(frame)
-            if self.use_one_way_audio and self.add_audio_chunk_callback:
+            if self.add_audio_chunk_callback:
                 current_time = datetime.utcnow()
                 userIdToSend = userId or self.active_speaker_id
                 if userIdToSend is not None:
@@ -864,7 +875,7 @@ class ZoomRTMSAdapter(BotAdapter):
     def initialize_rtms_connection(self):
         logger.info("Initializing RTMS connection...")
 
-        need_audio = self.use_one_way_audio or self.use_mixed_audio
+        need_audio = self.add_audio_chunk_callback is not None or self.use_mixed_audio
         need_video = self.use_video
 
         try:
@@ -874,10 +885,9 @@ class ZoomRTMSAdapter(BotAdapter):
                 join_payload=self.zoom_rtms,
                 use_audio=need_audio,
                 use_video=need_video,
-                # Only subscribe to transcript if we are NOT doing our own audio transcription
-                use_transcript=self.add_audio_chunk_callback is None,
+                use_transcript=self.upsert_caption_callback is not None,
                 # A mixed-audio consumer (recording, streaming) needs the mixed stream
-                use_per_participant_audio=self.use_one_way_audio and not self.use_mixed_audio,
+                use_per_participant_audio=self.add_audio_chunk_callback is not None and not self.use_mixed_audio,
                 adapter=self,
             )
 
@@ -949,8 +959,7 @@ class ZoomRTMSAdapter(BotAdapter):
                 }
             )
         elif json_data.get("type") == "transcriptUpdate":
-            # Don't need captions if we're transcribing from audio
-            if self.add_audio_chunk_callback:
+            if not self.upsert_caption_callback:
                 return
 
             logger.info("RTMS transcriptUpdate: %s", json_data)

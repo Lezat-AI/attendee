@@ -50,6 +50,9 @@ INSTALLED_APPS = [
 ]
 
 CREDENTIALS_ENCRYPTION_KEY = os.getenv("CREDENTIALS_ENCRYPTION_KEY")
+# Comma-separated extra keys that can decrypt but never encrypt. Only set while rotating
+# CREDENTIALS_ENCRYPTION_KEY. See bots/credentials_encryption_utils.py.
+CREDENTIALS_ENCRYPTION_KEY_FALLBACKS = [key.strip() for key in os.getenv("CREDENTIALS_ENCRYPTION_KEY_FALLBACKS", "").split(",") if key.strip()]
 
 AUTH_USER_MODEL = "accounts.User"
 
@@ -364,6 +367,11 @@ PREJOIN_LEAVE_OR_MEETING_END_IS_FATAL_ERROR = os.getenv("PREJOIN_LEAVE_OR_MEETIN
 # This flag is temporary, in the future we will remove this flag and always report the BOT_PUT_IN_WAITING_ROOM event for web bots.
 ENABLE_WAITING_ROOM_STATE_FOR_WEB_BOTS = os.getenv("ENABLE_WAITING_ROOM_STATE_FOR_WEB_BOTS", "false") == "true"
 
+# Web bots bind their websocket server to a fixed port per platform and try the next 10 ports if it is taken.
+# When enabled, each bot binds the fixed port on its own random loopback IP and Chrome maps localhost to it,
+# so any number of bots can share a network namespace. Linux only. The name is historical (it used to bind to port 0).
+ENABLE_BOT_WEBSOCKET_PORT_SELECTION_BY_OS = os.getenv("ENABLE_BOT_WEBSOCKET_PORT_SELECTION_BY_OS", "false") == "true"
+
 BOT_POD_NAMESPACE = os.getenv("BOT_POD_NAMESPACE", "attendee")
 WEBPAGE_STREAMER_POD_NAMESPACE = os.getenv("WEBPAGE_STREAMER_POD_NAMESPACE", "attendee-webpage-streamer")
 REQUIRE_HTTPS_WEBHOOKS = os.getenv("REQUIRE_HTTPS_WEBHOOKS", "true") == "true"
@@ -372,6 +380,9 @@ SHOW_CATEGORY_SELECTOR_IN_USAGE_DASHBOARD = os.getenv("SHOW_CATEGORY_SELECTOR_IN
 REQUIRE_STRING_VALUES_IN_METADATA = os.getenv("REQUIRE_STRING_VALUES_IN_METADATA", "true") == "true"
 MAX_METADATA_LENGTH = int(os.getenv("MAX_METADATA_LENGTH", 1000))
 SITE_DOMAIN = os.getenv("SITE_DOMAIN", "app.attendee.dev")
+INTERNAL_SITE_DOMAIN = os.getenv("INTERNAL_SITE_DOMAIN")
+USE_OKTA_LOGIN_FOR_SIGNED_IN_GOOGLE_MEET_BOTS = os.getenv("USE_OKTA_LOGIN_FOR_SIGNED_IN_GOOGLE_MEET_BOTS", "false") == "true"
+OKTA_BOT_LOGIN_DOMAIN = os.getenv("OKTA_BOT_LOGIN_DOMAIN")
 MASK_TRANSCRIPT_IN_LOGS = os.getenv("MASK_TRANSCRIPT_IN_LOGS", "false") == "true"
 ENFORCE_DOMAIN_ALLOWLIST_IN_CHROME = os.getenv("ENFORCE_DOMAIN_ALLOWLIST_IN_CHROME", "false") == "true"
 MONITOR_DOMAIN_ALLOWLIST_IN_CHROME = ENFORCE_DOMAIN_ALLOWLIST_IN_CHROME or (os.getenv("MONITOR_DOMAIN_ALLOWLIST_IN_CHROME", "false") == "true")
@@ -381,6 +392,9 @@ GLOBAL_WEBHOOK_DELIVERIES_PER_SECOND_RATE_LIMIT = int(os.getenv("GLOBAL_WEBHOOK_
 LOG_BOT_STATE_CHANGES = os.getenv("LOG_BOT_STATE_CHANGES", "false") == "true"
 LAUNCH_ADHOC_BOTS_ASYNC = os.getenv("LAUNCH_ADHOC_BOTS_ASYNC", "false") == "true"
 SHOW_TEAMS_BOT_IDENTIFICATION_CREDENTIALS = os.getenv("SHOW_TEAMS_BOT_IDENTIFICATION_CREDENTIALS", "false") == "true"
+GOOGLE_MEET_MOCAP_SPEED_FACTOR = float(os.getenv("GOOGLE_MEET_MOCAP_SPEED_FACTOR", 1.0))
+WEBEX_INTEGRATION_CLIENT_ID = os.getenv("WEBEX_INTEGRATION_CLIENT_ID")
+WEBEX_INTEGRATION_CLIENT_SECRET = os.getenv("WEBEX_INTEGRATION_CLIENT_SECRET")
 
 STORE_INFRASTRUCTURE_INFORMATION_IN_BOT_EVENT_METADATA = os.getenv("STORE_INFRASTRUCTURE_INFORMATION_IN_BOT_EVENT_METADATA", "true") == "true"
 
@@ -391,6 +405,9 @@ CONCURRENT_BOTS_LIMIT = int(os.getenv("CONCURRENT_BOTS_LIMIT", 2500))
 # AFTER: how late a missed bot can still be launched.
 SCHEDULED_BOT_LAUNCH_WINDOW_BEFORE_JOIN_AT_SECONDS = int(os.getenv("SCHEDULED_BOT_LAUNCH_WINDOW_BEFORE_JOIN_AT_SECONDS", 300))
 SCHEDULED_BOT_LAUNCH_WINDOW_AFTER_JOIN_AT_SECONDS = int(os.getenv("SCHEDULED_BOT_LAUNCH_WINDOW_AFTER_JOIN_AT_SECONDS", 300))
+
+# How long to wait before restarting the bot pod after the bot was blocked by the platform repeatedly.
+BLOCKED_BY_PLATFORM_POD_RESTART_DELAY_SECONDS = int(os.getenv("BLOCKED_BY_PLATFORM_POD_RESTART_DELAY_SECONDS", 15))
 
 CLEANTALK_API_KEY = os.getenv("CLEANTALK_API_KEY")
 USERCHECK_API_KEY = os.getenv("USERCHECK_API_KEY")

@@ -739,7 +739,7 @@ class StyleManager {
     }
 
     async openChatPanel() {
-        const chatButton = document.querySelector('button[aria-label="Chat with everyone"]');
+        const chatButton = document.querySelector('button[aria-label="Chat with everyone"], button[aria-label="Chat with everyone - New message"]');
         if (chatButton) {
             // Click to open the chat panel
             chatButton.click();
@@ -770,6 +770,11 @@ class StyleManager {
             window.ws.sendJson({
                 type: 'ChatStatusChange',
                 change: 'ready_to_send'
+            });
+        } else {
+            window.ws.sendJson({
+                type: 'Error',
+                message: 'Failed to find chat button in openChatPanel'
             });
         }
     }
@@ -960,8 +965,14 @@ class UserManager {
         this.currentUserId = null;
         // Track the set of parentDeviceIds (real participant deviceIds) currently screen sharing
         this.activeScreenSharerParentDeviceIds = new Set();
+        // Set once we've reported that another participant muted the bot; cleared when the bot unmutes
+        this.sentBotMediaDeviceStateChangedByOtherParticipant = false;
 
         this.ws = ws;
+    }
+
+    resetSentBotMediaDeviceStateChangedByOtherParticipant() {
+        this.sentBotMediaDeviceStateChangedByOtherParticipant = false;
     }
 
     deviceForStreamIsActive(streamId) {
@@ -1139,6 +1150,23 @@ class UserManager {
         }
 
         this.detectScreenShareChanges();
+        this.detectAudioMuteRequests(newUsersList);
+    }
+
+    detectAudioMuteRequests(users) {
+        if (this.sentBotMediaDeviceStateChangedByOtherParticipant)
+            return;
+
+        for (const user of users) {
+            if (user.isCurrentUser && user.audioMuteRequest?.byDeviceId) {
+                this.sentBotMediaDeviceStateChangedByOtherParticipant = true;
+                this.ws.sendJson({
+                    type: 'BotMediaDeviceStateChangedByOtherParticipant',
+                    other_participant_id: user.audioMuteRequest.byDeviceId,
+                    change_type: 'mute_microphone'
+                });
+            }
+        }
     }
 
     detectScreenShareChanges() {
@@ -1629,7 +1657,7 @@ const messageTypes = [
       {
         name: 'CollectionEvent',
         fields: [
-            { name: 'body', fieldNumber: 1, type: 'message', messageType: 'CollectionEventBody' }
+            { name: 'body', fieldNumber: 1, type: 'message', messageType: 'CollectionEventBody', repeated: true }
         ]
     },
     {
@@ -1713,9 +1741,16 @@ const messageTypes = [
             { name: 'profilePicture', fieldNumber: 3, type: 'string' },
             { name: 'status', fieldNumber: 4, type: 'varint' }, // in meeting = 1 vs not in meeting = 6. kicked out = 7? denied from lobby = 4?
             { name: 'isCurrentUserString', fieldNumber: 7, type: 'string' }, // Presence of this string indicates that this is the current user. The string itself seems to be a random uuid
+            { name: 'audioMuteRequest', fieldNumber: 12, type: 'message', messageType: 'AudioMuteRequest' },
             { name: 'displayName', fieldNumber: 29, type: 'string' },
             { name: 'parentDeviceId', fieldNumber: 21, type: 'string' }, // if this is present, then this is a screenshare device. The parentDevice is the person that is sharing
             { name: 'isHost', fieldNumber: 34, type: 'varint' } // Presence of this varint indicates that this is the host
+        ]
+    },
+    {
+        name: 'AudioMuteRequest',
+        fields: [
+            { name: 'byDeviceId', fieldNumber: 1, type: 'string' }
         ]
     },
     {
@@ -1909,30 +1944,50 @@ new FetchInterceptor(async (response) => {
 });
 
 const handleCollectionEvent = (event) => {
-  const decodedData = pako.inflate(new Uint8Array(event.data));
-  //console.log(' handleCollectionEventdecodedData', decodedData);
-  // Convert decoded data to base64
-  const base64Data = btoa(String.fromCharCode.apply(null, decodedData));
-  //console.log('Decoded collection event data (base64):', base64Data);
+  try {
+    const decodedData = pako.inflate(new Uint8Array(event.data));
+    //console.log(' handleCollectionEventdecodedData', decodedData);
+    // Convert decoded data to base64
+    // const base64Data = btoa(String.fromCharCode.apply(null, decodedData));
+    //console.log('Decoded collection event data (base64):', base64Data);
 
-  const collectionEvent = messageDecoders['CollectionEvent'](decodedData);
-  
-  const deviceOutputInfoList = collectionEvent.body.userInfoListWrapperAndChatWrapperWrapper?.deviceInfoWrapper?.deviceOutputInfoList;
+    const collectionEvent = messageDecoders['CollectionEvent'](decodedData);
+
+    for (const body of collectionEvent.body || []) {
+      try {
+        handleCollectionEventBody(body);
+      } catch (error) {
+        window.ws?.sendJson({
+          type: 'Error',
+          message: 'Error in handleCollectionEventBody: ' + error.message
+        });
+      }
+    }
+  } catch (error) {
+    window.ws?.sendJson({
+      type: 'Error',
+      message: 'Error in handleCollectionEvent: ' + error.message
+    });
+  }
+};
+
+const handleCollectionEventBody = (body) => {
+  const deviceOutputInfoList = body.userInfoListWrapperAndChatWrapperWrapper?.deviceInfoWrapper?.deviceOutputInfoList;
   if (deviceOutputInfoList) {
     userManager.updateDeviceOutputs(deviceOutputInfoList);
   }
 
-  const chatMessageWrapper = collectionEvent.body.userInfoListWrapperAndChatWrapperWrapper?.userInfoListWrapperAndChatWrapper?.chatMessageWrapper;
+  const chatMessageWrapper = body.userInfoListWrapperAndChatWrapperWrapper?.userInfoListWrapperAndChatWrapper?.chatMessageWrapper;
   if (chatMessageWrapper) {
     for (const chatMessage of chatMessageWrapper) {
         window.chatMessageManager?.handleChatMessage(chatMessage);
     }
   }
 
-  //console.log('deviceOutputInfoList', JSON.stringify(collectionEvent.body.userInfoListWrapperAndChatWrapperWrapper?.deviceInfoWrapper?.deviceOutputInfoList));
+  //console.log('deviceOutputInfoList', JSON.stringify(body.userInfoListWrapperAndChatWrapperWrapper?.deviceInfoWrapper?.deviceOutputInfoList));
   //console.log('usermap', userMap.allUsersMap);
-  //console.log('userInfoList And Event', collectionEvent.body.userInfoListWrapperAndChatWrapperWrapper.userInfoListWrapperAndChatWrapper.userInfoListWrapper);
-  const userInfoList = collectionEvent.body.userInfoListWrapperAndChatWrapperWrapper.userInfoListWrapperAndChatWrapper.userInfoListWrapper?.userInfoList || [];
+  //console.log('userInfoList And Event', body.userInfoListWrapperAndChatWrapperWrapper?.userInfoListWrapperAndChatWrapper?.userInfoListWrapper);
+  const userInfoList = body.userInfoListWrapperAndChatWrapperWrapper?.userInfoListWrapperAndChatWrapper?.userInfoListWrapper?.userInfoList || [];
   console.log('userInfoList in collection event', userInfoList);
   // This event is triggered when a single user joins (or leaves) the meeting
   // generally this array only contains a single user
@@ -2484,6 +2539,7 @@ function turnOnMic() {
     if (microphoneButton) {
         console.log("Clicking the microphone button to turn it on");
         microphoneButton.click();
+        window.userManager?.resetSentBotMediaDeviceStateChangedByOtherParticipant();
     } else {
         console.log("Microphone button not found");
     }
@@ -2506,6 +2562,7 @@ function turnOnMicAndCamera() {
     if (microphoneButton) {
         console.log("Clicking the microphone button to turn it on");
         microphoneButton.click();
+        window.userManager?.resetSentBotMediaDeviceStateChangedByOtherParticipant();
     } else {
         console.log("Microphone button not found");
     }
@@ -2561,6 +2618,7 @@ function turnOnMicAndScreenshare() {
     if (microphoneButton) {
         console.log("Clicking the microphone button to turn it on");
         microphoneButton.click();
+        window.userManager?.resetSentBotMediaDeviceStateChangedByOtherParticipant();
     } else {
         console.log("Microphone button not found");
     }
