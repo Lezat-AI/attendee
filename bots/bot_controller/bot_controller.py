@@ -2156,6 +2156,23 @@ class BotController:
                 self.cleanup()
                 return
 
+            # Lezat: on Railway there is no Kubernetes, so restart_bot_pod cannot recreate the bot
+            # and the bot was left in JOINING forever with its browser still running. Instead, close
+            # this attempt's browser and queue a fresh run of the same bot on a worker.
+            if not os.getenv("KUBERNETES_SERVICE_HOST"):
+                from bots.tasks.run_bot_task import run_bot
+
+                logger.info("Received message that we were blocked by platform repeatedly and not running in Kubernetes, so re-queueing the bot task")
+                try:
+                    self.adapter.cleanup()
+                except Exception as e:
+                    logger.warning(f"Error cleaning up adapter before re-queueing bot: {e}")
+                run_bot.apply_async(args=[self.bot_in_db.id], countdown=settings.BLOCKED_BY_PLATFORM_POD_RESTART_DELAY_SECONDS)
+                if self.main_loop and self.main_loop.is_running():
+                    logger.info("Quitting main loop")
+                    self.main_loop.quit()
+                return
+
             logger.info("Received message that we were blocked by platform repeatedly, so recreating pod")
             restart_bot_pod.apply_async(args=[self.bot_in_db.id], countdown=settings.BLOCKED_BY_PLATFORM_POD_RESTART_DELAY_SECONDS)
             # Don't do the normal cleanup tasks because we'll be restarting the pod

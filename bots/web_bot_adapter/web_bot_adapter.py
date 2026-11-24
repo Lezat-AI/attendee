@@ -1267,6 +1267,15 @@ class WebBotAdapter(BotAdapter):
         if self.debug_screen_recorder:
             self.debug_screen_recorder.stop()
 
+        # Lezat: workers are reused on Railway (no pod per bot), so stop our Xvfb instead of leaking it.
+        display = getattr(self, "display", None)
+        if display is not None:
+            try:
+                display.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping virtual display: {e}")
+            self.display = None
+
         # Properly shutdown the websocket server
         if self.websocket_server:
             try:
