@@ -2167,6 +2167,14 @@ class BotController:
                     self.adapter.cleanup()
                 except Exception as e:
                     logger.warning(f"Error cleaning up adapter before re-queueing bot: {e}")
+                # Same reset restart_bot_pod does, so the next run can take the join request again.
+                last_bot_event = self.bot_in_db.last_bot_event()
+                last_bot_event.requested_bot_action_taken_at = None
+                last_bot_event.metadata.setdefault("pod_recreations", []).append(int(time.time()))
+                last_bot_event.save()
+                self.bot_in_db.first_heartbeat_timestamp = None
+                self.bot_in_db.last_heartbeat_timestamp = None
+                self.bot_in_db.save()
                 run_bot.apply_async(args=[self.bot_in_db.id], countdown=settings.BLOCKED_BY_PLATFORM_POD_RESTART_DELAY_SECONDS)
                 if self.main_loop and self.main_loop.is_running():
                     logger.info("Quitting main loop")
